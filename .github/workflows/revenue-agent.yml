@@ -2,6 +2,10 @@ name: Revenue Agent
 
 on:
   workflow_dispatch:
+  push:
+    paths:
+      - "agent.py"
+      - ".github/workflows/revenue-agent.yml"
   schedule:
     - cron: "17 */6 * * *"
 
