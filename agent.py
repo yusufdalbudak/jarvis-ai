@@ -3,6 +3,7 @@
 
 The agent intentionally optimizes for quality over application volume:
 - fetch current hiring gigs,
+- reject seller ads mistakenly posted as hiring gigs,
 - filter for safe/credible work,
 - rank against a focused delivery profile,
 - avoid duplicates,
@@ -31,8 +32,6 @@ MAX_APPLICATIONS_PER_RUN = max(0, int(os.getenv("MAX_APPLICATIONS_PER_RUN", "1")
 AUTO_APPLY = os.getenv("AUTO_APPLY", "true").strip().lower() in {"1", "true", "yes", "on"}
 API_KEY = os.getenv("UGIG_API_KEY", "").strip()
 
-# Strong fit signals. Weights intentionally prefer bounded tasks that can be
-# verified objectively and delivered with reproducible evidence.
 FIT_TERMS: dict[str, int] = {
     "python": 6,
     "csv": 7,
@@ -70,8 +69,6 @@ FIT_TERMS: dict[str, int] = {
     "technical seo": 3,
 }
 
-# Clear mismatch signals: these are not necessarily bad work, just poor ROI for
-# this agent's current delivery profile.
 MISMATCH_TERMS = {
     "full-time",
     "full time",
@@ -94,8 +91,6 @@ MISMATCH_TERMS = {
     "smart contract audit",
 }
 
-# Work the agent will not automatically pursue. Ambiguous security work is
-# rejected rather than interpreted aggressively.
 RISK_TERMS = {
     "captcha bypass",
     "anti-bot bypass",
@@ -119,6 +114,40 @@ RISK_TERMS = {
     "scrape instagram",
 }
 
+SELLER_TITLE_PREFIXES = (
+    "i will ",
+    "i can ",
+    "i offer ",
+    "my service",
+    "hire me",
+)
+SELLER_AD_PHRASES = (
+    "what i do",
+    "what you get",
+    "what i deliver",
+    "best for:",
+    "perfect for:",
+    "my services",
+    "fast turnaround",
+    "delivery:",
+    "payment: platform escrow",
+    "payment preferred",
+    "log in to hire",
+)
+BUYER_INTENT_PHRASES = (
+    "we need",
+    "i need",
+    "looking for",
+    "seeking",
+    "need help",
+    "need someone",
+    "looking to hire",
+    "required deliverable",
+    "the task is",
+    "task:",
+    "requirements:",
+)
+
 
 @dataclass
 class Candidate:
@@ -131,7 +160,7 @@ class Candidate:
 
 def _request(path: str, *, method: str = "GET", payload: dict[str, Any] | None = None, auth: bool = False) -> Any:
     url = path if path.startswith("http") else f"{API_BASE}{path}"
-    headers = {"Accept": "application/json", "User-Agent": "yusuf-revenue-agent/1.0"}
+    headers = {"Accept": "application/json", "User-Agent": "yusuf-revenue-agent/1.1"}
     if payload is not None:
         headers["Content-Type"] = "application/json"
     if auth:
@@ -161,7 +190,6 @@ def _extract_list(obj: Any, preferred_keys: Iterable[str]) -> list[dict[str, Any
         value = obj.get(key)
         if isinstance(value, list):
             return [x for x in value if isinstance(x, dict)]
-    # Last-resort: accept the first list-shaped value.
     for value in obj.values():
         if isinstance(value, list):
             return [x for x in value if isinstance(x, dict)]
@@ -180,9 +208,6 @@ def fetch_gigs() -> list[dict[str, Any]]:
     try:
         obj = _request(f"/gigs?{params}")
     except RuntimeError as first_error:
-        # listing_type is supported by the live marketplace but is not shown in
-        # every API doc example. Fall back to a documented minimal query if the
-        # server changes that parameter.
         fallback = urllib.parse.urlencode({"page": 1, "limit": 100})
         try:
             obj = _request(f"/gigs?{fallback}")
@@ -198,7 +223,10 @@ def fetch_existing_gig_ids() -> set[str]:
     apps = _extract_list(obj, ("applications", "items", "data", "results"))
     ids: set[str] = set()
     for app in apps:
-        value = app.get("gig_id") or (app.get("gig") or {}).get("id") if isinstance(app.get("gig"), dict) else app.get("gig_id")
+        gig = app.get("gig")
+        value = app.get("gig_id")
+        if not value and isinstance(gig, dict):
+            value = gig.get("id")
         if value:
             ids.add(str(value))
     return ids
@@ -215,6 +243,16 @@ def _text(gig: dict[str, Any]) -> str:
         " ".join(map(str, ai_tools)) if isinstance(ai_tools, list) else str(ai_tools),
     ]
     return " ".join(str(p) for p in pieces if p).lower()
+
+
+def _looks_like_seller_ad(gig: dict[str, Any], text: str) -> bool:
+    title = str(gig.get("title", "")).strip().lower()
+    description = str(gig.get("description", "")).strip().lower()
+    if title.startswith(SELLER_TITLE_PREFIXES):
+        return True
+    seller_hits = sum(1 for phrase in SELLER_AD_PHRASES if phrase in description)
+    buyer_hits = sum(1 for phrase in BUYER_INTENT_PHRASES if phrase in text)
+    return seller_hits >= 2 and buyer_hits == 0
 
 
 def _number(value: Any) -> float | None:
@@ -269,6 +307,8 @@ def evaluate(gig: dict[str, Any]) -> Candidate | None:
         return None
 
     text = _text(gig)
+    if _looks_like_seller_ad(gig, text):
+        return None
     if any(term in text for term in RISK_TERMS):
         return None
     if any(term in text for term in MISMATCH_TERMS):
@@ -291,7 +331,6 @@ def evaluate(gig: dict[str, Any]) -> Candidate | None:
         return None
 
     age = _age_hours(gig)
-    # A stale listing is a poor target unless the API does not expose a date.
     if age is not None and age > 14 * 24:
         return None
 
@@ -329,7 +368,6 @@ def evaluate(gig: dict[str, Any]) -> Candidate | None:
         elif age > 7 * 24:
             score -= 2
 
-    # Prefer bounded descriptions; sprawling briefs generally hide delivery risk.
     description = str(gig.get("description", ""))
     if 50 <= len(description) <= 1800:
         score += 1
@@ -403,7 +441,7 @@ def main() -> int:
             candidates.append(candidate)
 
     candidates.sort(key=lambda c: (c.score, c.budget), reverse=True)
-    print(f"Qualified {len(candidates)} gigs after safety/fit/ROI filters.")
+    print(f"Qualified {len(candidates)} gigs after seller/safety/fit/ROI filters.")
 
     for c in candidates[:5]:
         print(
@@ -451,7 +489,6 @@ def main() -> int:
             )
             submitted += 1
         except RuntimeError as exc:
-            # Do not leak headers/API keys. The exception contains only response text.
             print(f"Application failed for {candidate.gig.get('id')}: {exc}", file=sys.stderr)
 
     return 0
