@@ -1,13 +1,9 @@
 #!/usr/bin/env python3
 """Bounded uGig revenue agent.
 
-The agent intentionally optimizes for quality over application volume:
-- fetch current hiring gigs,
-- reject seller ads mistakenly posted as hiring gigs,
-- filter for safe/credible work,
-- rank against a focused delivery profile,
-- avoid duplicates,
-- submit at most a small configured number of applications.
+The agent optimizes for qualified paid opportunities rather than application
+volume. It only considers remote hiring listings that look like genuine buyer
+requests, pass safety/ROI checks, and match a focused delivery profile.
 
 No third-party dependencies are required.
 """
@@ -17,6 +13,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import os
+import re
 import sys
 import urllib.error
 import urllib.parse
@@ -28,6 +25,7 @@ API_BASE = "https://ugig.net/api"
 PORTFOLIO_URL = "https://github.com/yusufdalbudak"
 
 MIN_BUDGET_USD = float(os.getenv("MIN_BUDGET_USD", "25"))
+MIN_SCORE = float(os.getenv("MIN_SCORE", "15"))
 MAX_APPLICATIONS_PER_RUN = max(0, int(os.getenv("MAX_APPLICATIONS_PER_RUN", "1")))
 AUTO_APPLY = os.getenv("AUTO_APPLY", "true").strip().lower() in {"1", "true", "yes", "on"}
 API_KEY = os.getenv("UGIG_API_KEY", "").strip()
@@ -89,6 +87,10 @@ MISMATCH_TERMS = {
     "door to door",
     "solidity",
     "smart contract audit",
+    "esp8266",
+    "arduino",
+    "pcb design",
+    "embedded firmware",
 }
 
 RISK_TERMS = {
@@ -114,6 +116,9 @@ RISK_TERMS = {
     "scrape instagram",
 }
 
+# The marketplace currently contains provider/service ads incorrectly classified
+# as hiring. Auto-applying to those would be spam, so detection is deliberately
+# conservative.
 SELLER_TITLE_PREFIXES = (
     "i will ",
     "i can ",
@@ -123,29 +128,56 @@ SELLER_TITLE_PREFIXES = (
 )
 SELLER_AD_PHRASES = (
     "what i do",
+    "what i can do",
     "what you get",
     "what i deliver",
+    "what i need from you",
     "best for:",
     "perfect for:",
     "my services",
     "fast turnaround",
+    "fast delivery",
     "delivery:",
     "payment: platform escrow",
     "payment preferred",
+    "tools i run",
+    "not included:",
+    "how it works:",
     "log in to hire",
+    "contact me",
+    "dm me",
+    "you send",
+    "i deliver",
+    "i build",
+    "i fix",
+    "i review",
+    "i analyze",
+    "i write",
+    "i provide",
 )
 BUYER_INTENT_PHRASES = (
     "we need",
-    "i need",
-    "looking for",
-    "seeking",
-    "need help",
-    "need someone",
+    "looking for someone",
+    "looking for a developer",
+    "looking for an analyst",
+    "looking for a researcher",
     "looking to hire",
+    "seeking a developer",
+    "seeking an analyst",
+    "seeking a researcher",
+    "need help with",
+    "need someone to",
+    "need a developer",
+    "need an analyst",
+    "need a researcher",
+    "project requires",
     "required deliverable",
+    "task is to",
     "the task is",
-    "task:",
-    "requirements:",
+    "please build",
+    "please fix",
+    "please analyze",
+    "please research",
 )
 
 
@@ -160,7 +192,7 @@ class Candidate:
 
 def _request(path: str, *, method: str = "GET", payload: dict[str, Any] | None = None, auth: bool = False) -> Any:
     url = path if path.startswith("http") else f"{API_BASE}{path}"
-    headers = {"Accept": "application/json", "User-Agent": "yusuf-revenue-agent/1.1"}
+    headers = {"Accept": "application/json", "User-Agent": "yusuf-revenue-agent/1.2"}
     if payload is not None:
         headers["Content-Type"] = "application/json"
     if auth:
@@ -198,12 +230,7 @@ def _extract_list(obj: Any, preferred_keys: Iterable[str]) -> list[dict[str, Any
 
 def fetch_gigs() -> list[dict[str, Any]]:
     params = urllib.parse.urlencode(
-        {
-            "listing_type": "hiring",
-            "sort": "newest",
-            "page": 1,
-            "limit": 100,
-        }
+        {"listing_type": "hiring", "sort": "newest", "page": 1, "limit": 100}
     )
     try:
         obj = _request(f"/gigs?{params}")
@@ -223,10 +250,9 @@ def fetch_existing_gig_ids() -> set[str]:
     apps = _extract_list(obj, ("applications", "items", "data", "results"))
     ids: set[str] = set()
     for app in apps:
-        gig = app.get("gig")
         value = app.get("gig_id")
-        if not value and isinstance(gig, dict):
-            value = gig.get("id")
+        if not value and isinstance(app.get("gig"), dict):
+            value = app["gig"].get("id")
         if value:
             ids.add(str(value))
     return ids
@@ -245,14 +271,33 @@ def _text(gig: dict[str, Any]) -> str:
     return " ".join(str(p) for p in pieces if p).lower()
 
 
+def _term_present(text: str, term: str) -> bool:
+    """Match short technology words without substring false positives.
+
+    Example: `react` must not match `reactive`.
+    """
+    if re.fullmatch(r"[a-z0-9.+#-]+", term):
+        return re.search(rf"(?<![a-z0-9]){re.escape(term)}(?![a-z0-9])", text) is not None
+    return term in text
+
+
 def _looks_like_seller_ad(gig: dict[str, Any], text: str) -> bool:
     title = str(gig.get("title", "")).strip().lower()
     description = str(gig.get("description", "")).strip().lower()
     if title.startswith(SELLER_TITLE_PREFIXES):
         return True
+
     seller_hits = sum(1 for phrase in SELLER_AD_PHRASES if phrase in description)
     buyer_hits = sum(1 for phrase in BUYER_INTENT_PHRASES if phrase in text)
-    return seller_hits >= 2 and buyer_hits == 0
+
+    # Multiple seller signals are sufficient to reject regardless of a stray
+    # buyer-looking phrase. With one seller signal, genuine buyer intent is
+    # required to keep the listing.
+    if seller_hits >= 2:
+        return True
+    if seller_hits == 1 and buyer_hits == 0:
+        return True
+    return False
 
 
 def _number(value: Any) -> float | None:
@@ -302,16 +347,15 @@ def _age_hours(gig: dict[str, Any]) -> float | None:
 
 
 def evaluate(gig: dict[str, Any]) -> Candidate | None:
-    gig_id = gig.get("id")
-    if not gig_id:
+    if not gig.get("id"):
         return None
 
     text = _text(gig)
     if _looks_like_seller_ad(gig, text):
         return None
-    if any(term in text for term in RISK_TERMS):
+    if any(_term_present(text, term) for term in RISK_TERMS):
         return None
-    if any(term in text for term in MISMATCH_TERMS):
+    if any(_term_present(text, term) for term in MISMATCH_TERMS):
         return None
 
     status = str(gig.get("status", "active")).lower()
@@ -338,7 +382,7 @@ def evaluate(gig: dict[str, Any]) -> Candidate | None:
     if applications is not None and applications > 15:
         return None
 
-    matched = [term for term in FIT_TERMS if term in text]
+    matched = [term for term in FIT_TERMS if _term_present(text, term)]
     if not matched:
         return None
 
@@ -374,6 +418,9 @@ def evaluate(gig: dict[str, Any]) -> Candidate | None:
     elif len(description) > 5000:
         score -= 3
 
+    if score < MIN_SCORE:
+        return None
+
     return Candidate(gig=gig, score=score, budget=budget, applications=applications, matched_terms=matched)
 
 
@@ -400,8 +447,7 @@ def proposed_timeline(budget: float) -> str:
 
 
 def cover_letter(candidate: Candidate) -> str:
-    gig = candidate.gig
-    title = str(gig.get("title", "this task")).strip()
+    title = str(candidate.gig.get("title", "this task")).strip()
     matches = ", ".join(candidate.matched_terms[:4])
     return (
         f"Hello — I can take on ‘{title}’ through an AI-assisted technical delivery workflow operated by Yusuf Dalbudak. "
@@ -413,15 +459,14 @@ def cover_letter(candidate: Candidate) -> str:
 
 
 def submit(candidate: Candidate) -> Any:
-    gig = candidate.gig
     payload: dict[str, Any] = {
-        "gig_id": str(gig["id"]),
+        "gig_id": str(candidate.gig["id"]),
         "cover_letter": cover_letter(candidate),
         "proposed_timeline": proposed_timeline(candidate.budget),
         "portfolio_items": [PORTFOLIO_URL],
         "ai_tools_to_use": ["ChatGPT"],
     }
-    rate = proposed_rate(gig, candidate.budget)
+    rate = proposed_rate(candidate.gig, candidate.budget)
     if rate is not None:
         payload["proposed_rate"] = rate
     return _request("/applications", method="POST", payload=payload, auth=True)
@@ -441,7 +486,7 @@ def main() -> int:
             candidates.append(candidate)
 
     candidates.sort(key=lambda c: (c.score, c.budget), reverse=True)
-    print(f"Qualified {len(candidates)} gigs after seller/safety/fit/ROI filters.")
+    print(f"Qualified {len(candidates)} gigs after buyer/safety/fit/ROI filters.")
 
     for c in candidates[:5]:
         print(
